@@ -12,6 +12,7 @@ import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.Parcelable
 import android.print.PageRange
 import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
@@ -58,7 +59,9 @@ import java.time.LocalDateTime
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         enableEdgeToEdge()
+
         setContent {
             VpdfTheme {
                 Scaffold(modifier = Modifier) { innerPadding ->
@@ -67,6 +70,7 @@ class MainActivity : ComponentActivity() {
                             .padding(innerPadding)
                             .fillMaxSize()
                             .background(Color.White),
+                        shareIntent = intent
                     )
                 }
             }
@@ -76,12 +80,44 @@ class MainActivity : ComponentActivity() {
 
 @RequiresApi(Build.VERSION_CODES.O)
 @Composable
-fun Home(modifier: Modifier = Modifier) {
+fun Home(modifier: Modifier = Modifier, shareIntent: Intent?) {
     val buttonWidth = 500.dp
     val context = LocalContext.current
 
-    var selectedAmount by remember { mutableIntStateOf(0) }
-    var fileUriList by remember { mutableStateOf(emptyList<Uri>()) }
+    val sharingFile = (shareIntent != null &&
+        shareIntent.action == Intent.ACTION_SEND)
+    val sharingFiles = (shareIntent != null &&
+        shareIntent.action == Intent.ACTION_SEND_MULTIPLE)
+    val selectedPdf by remember { mutableStateOf(
+        sharingFile && shareIntent!!.type!!.startsWith("application/pdf")) }
+
+
+    var selectedAmount by remember { mutableIntStateOf(
+        if (sharingFile) {
+            1
+        } else if (sharingFiles) {
+            // supress deprecated function since it would not supported desired platform: Android 11
+            @Suppress("DEPRECATION")
+            val uris: List<Uri>? = shareIntent!!.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            uris?.size ?: 0
+        } else {
+            0
+        }
+    ) }
+    var fileUriList by remember { mutableStateOf(
+        // supress deprecated functions since it would not support desired platform: Android 11
+        if (sharingFile) {
+            @Suppress("DEPRECATION")
+            val uri: Uri? = shareIntent!!.getParcelableExtra(Intent.EXTRA_STREAM)
+            if (uri != null) { listOf(uri) } else { emptyList() }
+        } else if (sharingFiles) {
+            @Suppress("DEPRECATION")
+            val uris: List<Uri>? = shareIntent!!.getParcelableArrayListExtra(Intent.EXTRA_STREAM)
+            uris ?: emptyList()
+        } else {
+            emptyList<Uri>()
+        }
+    ) }
 
     var pdfName = "${LocalDateTime.now()}"
     var pdfFile: ByteArray? by remember { mutableStateOf(null) }
@@ -102,9 +138,9 @@ fun Home(modifier: Modifier = Modifier) {
             putExtra(Intent.EXTRA_STREAM, fileUri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        val shareIntent = Intent.createChooser(intent, null)
+        val sharingIntent = Intent.createChooser(intent, null)
 
-        context.startActivity(shareIntent, null)
+        context.startActivity(sharingIntent, null)
     }
 
 
@@ -163,7 +199,9 @@ fun Home(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .padding(20.dp)
                 .width(buttonWidth),
-            enabled = pdfFile == null && fileUriList.isNotEmpty(),
+            // TODO check if fileUriList is a single file and is pdf
+            // if so, disable this button AND the save pdf button
+            enabled = pdfFile == null && fileUriList.isNotEmpty() && !selectedPdf,
             onClick = {
                 // TODO notify user
                 pdfFile = makePdfFile(
@@ -189,6 +227,8 @@ fun Home(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .padding(20.dp)
                 .width(buttonWidth),
+            // TODO check if fileUriList is a single file and is pdf
+            // if so, disable this button AND the convert PDF button
             enabled = pdfFile != null && enableSavePdf,
             onClick = {
                 // TODO notify user
@@ -214,11 +254,21 @@ fun Home(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .padding(20.dp)
                 .width(buttonWidth),
-            enabled = pdfFile != null && savedPdfUri != Uri.EMPTY,
+            // only enables this button if pdf file has been saved
+            // since it requires that saved file onClick
+            enabled = (pdfFile != null && savedPdfUri != Uri.EMPTY) || (selectedPdf && (sharingFile || sharingFiles)),
             onClick = {
-                // TODO pop up request to confirm not to save PDFs before print
                 if ( pdfFile != null) {
                     openPrinterApp(context = context, fileUri = savedPdfUri)
+                } else if (sharingFile) {
+                    openPrinterApp(context = context, fileUri = fileUriList[0])
+                } else if (sharingFiles) {
+                    // share multiple files to printer
+                    // issue:
+                    // fileUriList can have both PDFs and normal files (images, docs, text files
+                    // cannot print non pdf file
+                    // is it viable to convert a pdf into a pdf?
+                    TODO()
                 }
             }
         ) {
@@ -237,6 +287,7 @@ private fun makePdfFile(context: Context, uriList: List<Uri>): ByteArray {
     uriList.forEachIndexed {index, uri ->
         val mimeType = context.contentResolver.getType(uri) ?: ""
 
+        // converts file into a bitmap
         val bitmap = when {
             mimeType.startsWith("image/") -> {
                 val stream = context.contentResolver.openInputStream(uri)
@@ -251,7 +302,7 @@ private fun makePdfFile(context: Context, uriList: List<Uri>): ByteArray {
         }
 
         // create one PDF page for each file
-        bitmap?.let {
+        bitmap.let {
             val pageInfo = PdfDocument.PageInfo.Builder(it.width, it.height, index + 1).create()
             val page = pdfDocument.startPage(pageInfo)
             page.canvas.drawBitmap(it, 0f, 0f, null)
@@ -259,10 +310,10 @@ private fun makePdfFile(context: Context, uriList: List<Uri>): ByteArray {
         }
     }
 
+    // saves pdf file into ByteArray variable
     val outputStream = ByteArrayOutputStream()
     pdfDocument.writeTo(outputStream)
     pdfDocument.close()
-
     return outputStream.toByteArray()
 }
 
@@ -273,8 +324,10 @@ private fun savePdfFile(context: Context, byteArray: ByteArray, fileName: String
         put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOCUMENTS)
         put(MediaStore.MediaColumns.IS_PENDING, 1)
     }
+
     val uri = context.contentResolver.insert(MediaStore.Files.getContentUri("external"), contentValues)
         ?: throw IOException("Failed to create MediaStore entry")
+
     context.contentResolver.openOutputStream(uri)?.use { outputStream ->
         outputStream.write(byteArray)
     } ?: throw IOException("Failed to open OutputStream")
@@ -340,6 +393,7 @@ private fun HomePreview() {
                     .padding(innerPadding)
                     .fillMaxSize()
                     .background(Color.White),
+                shareIntent = null
             )
         }
     }
